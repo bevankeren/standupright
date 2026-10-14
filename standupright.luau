@@ -1,7 +1,7 @@
 -- Blizzard Hub / Stand Upright: Rebooted
--- Version 1.0.2. Public distribution is separate; no Auto Execute.
+-- Version 1.0.4. Public distribution is separate; no Auto Execute.
 -- Stand actions are bound from the character's native input source, never guessed.
-local VERSION = "1.0.2"
+local VERSION = "1.0.4"
 -- Pinned Airflow UI (joustingmatch/-3, fork of PookiePepelsss/Airflow-UI).
 local UI_REVISION = "3d74124f1d3fbc653cef118088c006b394b87867"
 local UI_URL = "https://raw.githubusercontent.com/joustingmatch/-3/" .. UI_REVISION .. "/Source.luau"
@@ -221,6 +221,9 @@ function C:StandSummary()
 end
 function C:UseSkill(id, target, owner)
     if self.Closed or not networkReady()then return false,"Game server disconnected"end
+    if owner=="AutoFarmLevel" and self.Movement and self.Movement.PreparingStand and id~="Summon" then
+        return false,"Preparing the stand"
+    end
     if id=="Summon"then
         local move=self.Movement
         if not move or not self:IsCombatAttached(move.Target,move.Owner)then
@@ -367,6 +370,9 @@ function C:ReleaseCollisions(owner)
 end
 function C:MaintainCollisions()
     if self.Closed then return end
+    if self.BringRadius then
+        if self.Settings.AutoFarmLevel then self:AcquireBringRadius()else self:ReleaseBringRadius()end
+    end
     local stale={}
     for owner,scope in pairs(self.CollisionScopes)do
         local humanoid=scope.Character:FindFirstChildOfClass("Humanoid")
@@ -382,6 +388,7 @@ function C:MaintainCollisions()
 end
 function C:ReleaseMovement(owner)
     local move = self.Movement
+    if owner=="AutoFarmLevel" or (not owner and move and move.Owner=="AutoFarmLevel")then self:ReleaseBringRadius()end
     if not move or (owner and move.Owner ~= owner) then return end
     self.Movement = nil
     -- Only NPC interaction sets this hook; baseline farm movement stays unchanged.
@@ -462,9 +469,13 @@ function C:AttachUnderTarget(target, job, owner, skipBring)
 end
 function C:HasNPCControl(root,playerRoot)
     if not root or not playerRoot then return false,false end
+    local apiSupported=false
     if type(isnetworkowner)=="function" then
         local ok,owned=pcall(isnetworkowner,root)
-        if ok and type(owned)=="boolean" then return not root.Anchored and owned,true end
+        if ok and type(owned)=="boolean" then
+            apiSupported=true
+            if owned then return not root.Anchored,true end
+        end
     end
     if type(gethiddenproperty)=="function" then
         local a,own=pcall(gethiddenproperty,playerRoot,"NetworkOwnerV3")
@@ -473,7 +484,25 @@ function C:HasNPCControl(root,playerRoot)
             return not root.Anchored and own>1 and peer==own,true
         end
     end
-    return false,false -- Unsupported is different from a supported check reporting no ownership.
+    return false,apiSupported -- A mobile API returning false must not hide a valid peer-ID check.
+end
+function C:AcquireBringRadius()
+    if not self.Settings.AutoFarmLevel or self.Closed or type(gethiddenproperty)~="function"or type(sethiddenproperty)~="function" then return end
+    local ok,current=pcall(gethiddenproperty,player,"SimulationRadius")
+    local valid,maximum=pcall(gethiddenproperty,player,"MaximumSimulationRadius")
+    if not ok or not valid or type(current)~="number"or type(maximum)~="number" then return end
+    local lease=self.BringRadius
+    if not lease then lease={Original=current,Applied=math.min(math.max(current,64),maximum),NextAt=0};self.BringRadius=lease end
+    if os.clock()>=lease.NextAt then
+        lease.NextAt=os.clock()+.2
+        if current<lease.Applied then pcall(sethiddenproperty,player,"SimulationRadius",lease.Applied)end
+    end
+end
+function C:ReleaseBringRadius()
+    local lease=self.BringRadius;self.BringRadius=nil
+    if not lease then return end
+    local ok,current=pcall(gethiddenproperty,player,"SimulationRadius")
+    if ok and current==lease.Applied then pcall(sethiddenproperty,player,"SimulationRadius",lease.Original)end
 end
 function C:ReleaseBring(owner)
     local state=self.BringState
@@ -500,6 +529,24 @@ function C:BringTarget(target,job,owner)
     if not character or not tr or not th or th.Health<=0 or Players:GetPlayerFromCharacter(target)then return false,"Waiting for NPC"end
     local state=self.BringState
     if not state or state.Owner~=owner then
+        local controlled,supported=self:HasNPCControl(tr,root)
+        if owner=="AutoFarmLevel" and not controlled then
+            self:ReleaseInputs(owner)
+            local move=self:ClaimMovement(owner);if not move then return false,"Waiting for movement"end
+            if move.PendingBringTarget~=target then
+                local origin=tr.Position-Vector3.new(0,self.Settings.BringDepth,0)
+                if origin.Y<=workspace.FallenPartsDestroyHeight+30 then return false,"Bring position is too close to the void"end
+                local look=Vector3.new(tr.CFrame.LookVector.X,0,tr.CFrame.LookVector.Z)
+                if look.Magnitude<.01 then look=Vector3.new(0,0,-1)end
+                move.PendingBringTarget=target;move.PendingBringPose=CFrame.lookAt(origin,origin+look.Unit)
+            end
+            if not move.ReturnCFrame then move.ReturnCFrame=root.CFrame end
+            self:AcquireCollisions(owner,character)
+            move.LastApplied=move.PendingBringPose;self:WaitLevelUnderground(job)
+            job.WaitingForBring=true
+            return false,supported and "Waiting underground for the mob"or "Bring is unavailable in this executor. Farming is paused."
+        end
+        if owner=="AutoFarmLevel" then self:ResumeLevelMovement()end
         local attached,reason=self:AttachUnderTarget(target,job,owner,true)
         if not attached then return false,reason end
         if not self:HasNPCControl(tr,root)then
@@ -573,7 +620,9 @@ function C:BringTarget(target,job,owner)
         -- Never derive player Y from the mob's replicated/rollback position.
         local slot=primary.Slot
         local held=state.Anchor*CFrame.new((slot%3-1)*5,0,-math.floor(slot/3)*5)
-        local position=held.Position-held.LookVector*(move.BehindDistance or 4)
+        local controlled=self:HasNPCControl(primary.Root,root)
+        local distance=controlled and (move.BehindDistance or 4) or 12
+        local position=held.Position-held.LookVector*distance
         local cf=CFrame.lookAt(position,held.Position)
         move.Humanoid.AutoRotate=false;move.AppliedAutoRotate=false;self:MaintainCollisions()
         root.CFrame=cf;root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
@@ -584,12 +633,16 @@ function C:BringTarget(target,job,owner)
             move.Humanoid:ChangeState(Enum.HumanoidStateType.Running)
         end
         move.LastApplied=cf;state.Count=count
-        if not self:HasNPCControl(primary.Root,root)then
+        if not controlled then
+            job.WaitingForBring=true
             job.Reason="Waiting underground for the mob";self:ReleaseInputs(owner);return
         end
+        if job.WaitingForBring then job.QuestProgressAt=os.clock()end
+        job.WaitingForBring=nil
     end
     if not move.AttachConnection then move.AttachConnection=RunService.Heartbeat:Connect(follow)end
     follow()
+    if job.WaitingForBring then return false,job.Reason or "Waiting underground for the mob"end
     if not self:IsCombatAttached(target,owner)then return false,"Waiting for behind attachment"end
     return true,"Behind attachment | "..tostring(state.Count or 0).." mobs held"
 end
@@ -644,6 +697,9 @@ function C:IsCombatAttached(target,owner)
         or not job or job.Cancelled or not self.Settings[owner]
         or not tr or not th or th.Health<=0 or Players:GetPlayerFromCharacter(target)then return false end
     local delta=root.Position-tr.Position
+    if owner=="AutoFarmLevel" and move.PreparingStand then
+        return delta.Y<=-10 and delta.Y>=-64 and Vector2.new(delta.X,delta.Z).Magnitude<=2
+    end
     if move.Behind and (self.Settings.BringMob or owner=="AutoFarmLevel") and self.BringState and self.BringState.Items[target]then
         if not self:HasNPCControl(tr,root)then return false end
         local localPos=tr.CFrame:PointToObjectSpace(root.Position)
@@ -697,24 +753,29 @@ function C:FarmTargetStep(target,job,owner)
     self:ObserveFarmDamage(job)
     if job.Target~=target then
         job.Target=target;job.Health=humanoid.Health;job.ProgressAt=os.clock();job.Stalls=0;job.RetryAt=nil;job.RangeAdjusted=nil;job.AttackAt=nil
-        job.BringControlWaitAt=nil;job.BringFallbackTarget=nil
+        job.WaitingForBring=nil
     end
     job.Health=math.max(0,humanoid.Health)
     if job.RetryAt and os.clock()<job.RetryAt then return false,"Waiting before retry" end
-    local targetRoot=target:FindFirstChild("HumanoidRootPart")
-    local controlled,controlSupported=self:HasNPCControl(targetRoot,player.Character and player.Character:FindFirstChild("HumanoidRootPart"))
-    if owner=="AutoFarmLevel" and not controlled then
-        job.BringControlWaitAt=job.BringControlWaitAt or os.clock()
-        if not controlSupported or os.clock()-job.BringControlWaitAt>=8 then job.BringFallbackTarget=target end
-    elseif controlled then job.BringControlWaitAt=nil end
-    -- Sticky per target: do not bounce between 20-stud bring and 5-stud farming when ownership flickers.
-    local fallback=owner=="AutoFarmLevel" and job.BringFallbackTarget==target
-    if fallback and self.BringState and self.BringState.Owner==owner then
-        if self.Movement and self.Movement.AttachConnection then self.Movement.AttachConnection:Disconnect();self.Movement.AttachConnection=nil end
-        self:ReleaseBring(owner)
-        if self.Movement then self.Movement.Behind=nil end
+    if owner=="AutoFarmLevel" then
+        self:AcquireBringRadius()
+        if not self:IsStandSummoned(player.Character) then
+            local move=self:ClaimMovement(owner);if not move then return false,"Waiting for movement"end
+            local tr=target:FindFirstChild("HumanoidRootPart")
+            if not tr then return false,"Waiting for the mob"end
+            if self.BringState then self:ReleaseBring(owner)end
+            local origin=tr.Position-Vector3.new(0,math.max(10,self.Settings.BringDepth),0)
+            if origin.Y<=workspace.FallenPartsDestroyHeight+30 then return false,"Bring position is too close to the void"end
+            if not move.ReturnCFrame then move.ReturnCFrame=move.Root.CFrame end
+            move.LastApplied=CFrame.new(origin);self:AcquireCollisions(owner,move.Character)
+            self:WaitLevelUnderground(job);move.Target=target;move.PreparingStand=true
+            job.WaitingForBring=true
+            local ready,reason=self:EnsureCombatStand(target,owner)
+            return false,ready and "Stand ready; gathering mobs"or reason
+        end
+        if self.Movement then self.Movement.PreparingStand=nil end
     end
-    local inRange,reason=self:AttachUnderTarget(target,job,owner,fallback)
+    local inRange,reason=self:AttachUnderTarget(target,job,owner)
     if not inRange then job.ProgressAt=os.clock();return false,reason end
     local summoned,summonReason=self:EnsureCombatStand(target,owner)
     if not summoned then job.ProgressAt=os.clock();return false,summonReason end
@@ -737,7 +798,7 @@ function C:FarmTargetStep(target,job,owner)
     end
     local fired,message=self:UseSkill("M1",target,owner)
     if fired then job.AttackAt=os.clock()end
-    return fired,fired and ("Attacking "..target.Name..(fallback and " | Farming below mob" or "")..string.format(" | Damage %.1f",job.ConfirmedDamage or 0)) or message
+    return fired,fired and ("Attacking "..target.Name..string.format(" | Damage %.1f",job.ConfirmedDamage or 0)) or message
 end
 local function inLair()
     local character = player.Character
@@ -970,6 +1031,10 @@ function C:AcceptLevelQuest(npc,job)
 end
 function C:AutoFarmLevelStep(job)
     local owner="AutoFarmLevel"
+    if standName()=="None" or standName()=="" then
+        self:ReleaseInputs(owner);self:WaitLevelUnderground(job)
+        return false,"Equip a stand before starting level farming"
+    end
     if inLair()then return false,"Waiting: leave the lair"end
     for _,id in ipairs({"AutoFarmMob","AutoLair","AutoSkill","BringMob","Fly"})do
         local other=self.Jobs[id];if other and not other.Cancelled and self.JobArmed[id]then
@@ -1034,7 +1099,7 @@ function C:AutoFarmLevelStep(job)
         return false,reason
     end
     if quest.Kills~=job.LastKills then job.LastKills=quest.Kills;job.QuestProgressAt=os.clock()end
-    if os.clock()-(job.QuestProgressAt or os.clock())>120 then
+    if not job.WaitingForBring and os.clock()-(job.QuestProgressAt or os.clock())>120 then
         job.Cancelled=true;return false,"Stopped: quest counter did not progress"
     end
     local target=job.Target;local h=target and target:FindFirstChildOfClass("Humanoid")
@@ -1585,6 +1650,7 @@ function C:TryPickup(candidate,job)
 end
 function C:StopJob(id)
     self:ObserveFarmDamage(self.Jobs[id])
+    if id=="AutoFarmLevel"then self:ReleaseBringRadius()end
     if id=="Fly"then self.FlyVertical=0 end
     if id=="SpeedBoost"then self:ReleaseSpeed()end
     if id=="BringMob"then self:ReleaseBring()end
