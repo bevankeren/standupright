@@ -1,7 +1,7 @@
 -- Blizzard Hub / Stand Upright: Rebooted
--- Version 1.0.4. Public distribution is separate; no Auto Execute.
+-- Version 1.0.6. Public distribution is separate; no Auto Execute.
 -- Stand actions are bound from the character's native input source, never guessed.
-local VERSION = "1.0.4"
+local VERSION = "1.0.6"
 -- Pinned Airflow UI (joustingmatch/-3, fork of PookiePepelsss/Airflow-UI).
 local UI_REVISION = "3d74124f1d3fbc653cef118088c006b394b87867"
 local UI_URL = "https://raw.githubusercontent.com/joustingmatch/-3/" .. UI_REVISION .. "/Source.luau"
@@ -16,7 +16,7 @@ local TeleportService = game:GetService("TeleportService")
 local function networkReady()
     return NetworkClient:FindFirstChildOfClass("ClientReplicator")~=nil
 end
-local JOB_IDS = {"AutoFarmLevel", "AutoSkill", "AutoFarmMob", "AutoLair", "AutoPickup", "AntiVoid", "Noclip", "AutoRejoin", "BringMob", "Fly", "SpeedBoost"}
+local JOB_IDS = {"AutoFarmLevel", "AutoSkill", "AutoFarmMob", "AutoLair", "AutoPickup", "AntiVoid", "Noclip", "AutoRejoin", "AutoPlay", "BringMob", "Fly", "SpeedBoost"}
 local player = assert(Players.LocalPlayer, "Local player is unavailable.")
 local env = getgenv()
 local bootReceipt={Version=VERSION,PlaceId=game.PlaceId,JobId=game.JobId,State="Starting"}
@@ -48,9 +48,9 @@ local C = {
         UIScale = 110, Snow = true, SnowArea = "UI",
         LairWebhook = false, LevelWebhook = false, WebhookHideName = true, Noclip = false,
         AutoQuestFarm = false, QuestId = "", MerchantNpc = "", MerchantOption = "",
-        AutoRejoin = false, RejoinMinutes = 120, BringMob=false, BringDepth=20,
+        AutoRejoin = false, RejoinMinutes = 120, AutoPlay=false, BringMob=false, BringDepth=20,
         Fly=false, FlySpeed=45, SpeedBoost=false, WalkSpeed=32},
-    Config = {Loaded = nil, Autosave = false, Autoload = nil},
+    Config = {Loaded = nil, Autoload = nil},
     Evidence = {
         AutoSummon = {Stands = {"WhiteSnake","TA4"}, Level = "server SummonPacket", Date = "2026-10-11"},
         AutoSkill = {Stand = "TA4", Skill = "Barrage", Damage = 39.225120544434, ReleasedOnStop = true, Date = "2026-10-11"},
@@ -1690,7 +1690,7 @@ function C:StartJob(id, step, delay)
         while not self.Closed and not job.Cancelled and self.Settings[id] do
             job.Active = false
             if not networkReady()then self.DisconnectReason="Game server disconnected";self:Cleanup();break
-            elseif not alive() then job.Reason = "Waiting for character"
+            elseif id~="AutoPlay"and not alive() then job.Reason = "Waiting for character"
             elseif UserInputService:GetFocusedTextBox() then job.Reason = "Waiting for text input"
             else
                 local ok, active, reason = pcall(step, job)
@@ -1764,6 +1764,9 @@ function C:Cleanup()
     self:ReleaseInputs()
     self:ReleaseMovement()
     self:ReleaseCollisions();table.clear(self.JobArmed)
+    for flag,entry in pairs(self.NativeConfigFlags or {})do
+        if self.Airflow and self.Airflow.Flags[flag]==entry then self.Airflow.Flags[flag]=nil end
+    end
     for _, connection in ipairs(self.Connections) do connection:Disconnect() end
     table.clear(self.Connections)
     if self.Library and not self.Library.Unloaded then self.Library:Unload() end
@@ -1803,6 +1806,7 @@ SPEC.SpeedBoost={kind="boolean"};SPEC.WalkSpeed={kind="number",min=16,max=100}
 SPEC.QuestPosition={kind="choice",values={"Below NPC","Original position"}};SPEC.AutoFarmLevel={kind="boolean"};SPEC.AutoQuestFarm={kind="boolean"};SPEC.QuestId={kind="string"}
 SPEC.MerchantNpc={kind="string"};SPEC.MerchantOption={kind="choice",values={"","Option1","Option2","Option3","Option4"}}
 SPEC.AutoRejoin={kind="boolean"};SPEC.RejoinMinutes={kind="number",min=1,max=1440}
+SPEC.AutoPlay={kind="boolean"}
 local APPEARANCE_PRESETS = {
     Blizzard={AccentHex="64CDD7",SurfaceHex="101118"},
     Frost={AccentHex="8FDFE4",SurfaceHex="161C25"},
@@ -1957,17 +1961,6 @@ end
 local fileAPI = type(readfile) == "function" and type(writefile) == "function"
     and type(isfile) == "function" and type(isfolder) == "function"
     and type(makefolder) == "function" and type(listfiles) == "function" and type(delfile) == "function"
-local function prepareDirectories()
-    assert(fileAPI, "Executor file APIs are unavailable.")
-    for _, path in ipairs({"BlizzardHub", STORAGE, STORAGE .. "/Configs"}) do
-        if not isfolder(path) then makefolder(path) end
-    end
-end
-local function profilePath(name)
-    assert(type(name) == "string" and #name >= 1 and #name <= 48
-        and name:match("^[%w_%- ]+$") and not name:match(" $"), "Use a valid config name.")
-    return STORAGE .. "/Configs/" .. name .. ".json"
-end
 function C:Snapshot()
     return {Schema = 1, Hub = "BlizzardStandUpright", PlaceId = game.PlaceId, Settings = copy(self.Settings)}
 end
@@ -2003,7 +1996,7 @@ end
 function C:Apply(data)
     local values = self:Validate(data)
     self:StopEverything()
-    -- Loading preferences is not permission to start automation.
+    -- Apply is also used for snapshots; only an explicit config load starts jobs.
     self.Settings = values
     self.Applying = true
     for id, control in pairs(self.Controls) do
@@ -2041,96 +2034,155 @@ end
 function C:ResumeConfiguredJobs()
     assert(not self.Closed,"Hub is unloaded.")
     for _, id in ipairs(JOB_IDS) do
-        if self.Settings[id] and self.JobFactories[id] then self.JobFactories[id](true) end
+        local job=self.Jobs[id]
+        if self.Settings[id] and self.JobFactories[id] and (not job or job.Cancelled) then
+            self.JobFactories[id](true)
+        end
     end
     self.WebhookArmedEvents.LairComplete=self.Settings.LairWebhook==true
     self.WebhookArmedEvents.LevelUp=self.Settings.LevelWebhook==true
     self.WebhookArmed=self.Settings.LairWebhook==true or self.Settings.LevelWebhook==true
 end
-function C:SaveProfile(name, create)
-    prepareDirectories(); local path = profilePath(name)
-    assert(not create or not isfile(path), "Config already exists.")
-    local encoded = Http:JSONEncode(self:Snapshot())
-    writefile(path, encoded); assert(readfile(path) == encoded, "Config could not be saved.")
-    self:Validate(Http:JSONDecode(readfile(path)))
-    self.Config.Loaded = name
-    self.Config.LastSnapshot = encoded; self.Config.LastSavedAt = os.clock()
-end
-function C:LoadProfile(name)
-    prepareDirectories(); local raw = readfile(profilePath(name))
-    assert(#raw <= 65536, "Config is too large.")
-    self:Apply(Http:JSONDecode(raw)); self.Config.Loaded = name
-    self.Config.LastSnapshot = Http:JSONEncode(self:Snapshot())
-end
-function C:ImportProfile(name, raw)
-    assert(type(raw) == "string" and #raw <= 65536, "Config is too large or invalid.")
-    local data = Http:JSONDecode(raw); self:Validate(data)
-    prepareDirectories(); local path = profilePath(name); assert(not isfile(path), "Config already exists.")
-    local encoded = Http:JSONEncode(data); writefile(path, encoded)
-    assert(readfile(path) == encoded, "Import write could not be verified.")
-end
-function C:ProfileNames()
-    prepareDirectories(); local out = {}
-    for _, path in ipairs(listfiles(STORAGE .. "/Configs")) do
-        local name = path:gsub("\\", "/"):match("/([^/]+)%.json$")
-        if name and pcall(profilePath, name) then table.insert(out, name) end
+-- Airflow owns config storage, sharing, CRUD and autoload. This bridge only
+-- supplies stable game values and applies them atomically before starting jobs.
+function C:InstallNativeConfigs(window,airflow)
+    self.ConfigDefaults=self:Snapshot()
+    self.NativeConfigFlags={}
+    local prefix="BlizzardStandUpright_"
+    local types={boolean="Toggle",number="Slider",string="Input",hex="Input",choice="Dropdown",array="Dropdown"}
+    for id,spec in pairs(SPEC)do
+        local flag=prefix..id
+        local entry={_type=assert(types[spec.kind]),_defaultEntry={Type=types[spec.kind],Value=copy(self.ConfigDefaults.Settings[id])}}
+        function entry:Get()return copy(C.Settings[id])end
+        airflow.Flags[flag]=entry
+        self.NativeConfigFlags[flag]=entry
     end
-    table.sort(out); return out
-end
-local PREFERENCES_PATH = STORAGE .. "/preferences.json"
-function C:SavePreferences()
-    prepareDirectories()
-    local autoload = self.Config.Autoload or ""
-    if autoload ~= "" then profilePath(autoload) end
-    local raw=Http:JSONEncode({Schema=1,Hub="BlizzardStandUpright",PlaceId=game.PlaceId,
-        Autosave=self.Config.Autosave,Autoload=autoload})
-    writefile(PREFERENCES_PATH,raw)
-    assert(readfile(PREFERENCES_PATH)==raw,"Preference write could not be verified.")
-end
-function C:ReadPreferences()
-    if not fileAPI or not isfile(PREFERENCES_PATH) then return end
-    local raw=readfile(PREFERENCES_PATH);assert(#raw<=8192,"Preferences are too large.")
-    local data=Http:JSONDecode(raw)
-    assert(type(data)=="table"and data.Schema==1 and data.Hub=="BlizzardStandUpright"
-        and data.PlaceId==8540168650 and type(data.Autosave)=="boolean"and type(data.Autoload)=="string","Invalid preferences.")
-    if data.Autoload~=""then profilePath(data.Autoload)end
-    self.Config.Autosave=data.Autosave
-    self.Config.Autoload=data.Autoload~=""and data.Autoload or nil
-end
-function C:SetAutoloadProfile(name)
-    if name then
-        prepareDirectories();local path=profilePath(name);assert(isfile(path),"Config is unavailable.")
-        local raw=readfile(path);assert(#raw<=65536,"Config is too large.");self:Validate(Http:JSONDecode(raw))
-    end
-    local old=self.Config.Autoload;self.Config.Autoload=name
-    local ok,err=pcall(function()self:SavePreferences()end)
-    if not ok then self.Config.Autoload=old;error(err)end
-end
-function C:SetAutosave(value)
-    assert(type(value)=="boolean","Invalid autosave preference.")
-    local old=self.Config.Autosave;self.Config.Autosave=value
-    local ok,err=pcall(function()self:SavePreferences()end)
-    if not ok then self.Config.Autosave=old;error(err)end
-end
-function C:PollAutosave()
-    if self.Closed or self.Applying or not self.Config.Autosave or not self.Config.Loaded or not fileAPI then return end
-    if os.clock()<(self.Config.NextSaveAt or 0)then return end
-    self.Config.NextSaveAt=os.clock()+2
-    local path=profilePath(self.Config.Loaded)
-    if not isfile(path)then self.Config.Loaded=nil;return end
-    local encoded=Http:JSONEncode(self:Snapshot())
-    if encoded==self.Config.LastSnapshot then return end
-    local ok,err=pcall(function()self:SaveProfile(self.Config.Loaded,false)end)
-    if not ok then
-        self.Config.NextSaveAt=os.clock()+15;self.Config.SaveError=tostring(err)
-        if not self.Config.Warned then
-            self.Config.Warned=true
-            self.Library:Notify({Title="Config not saved",Description="Check executor file storage.",Time=5})
+    local function configData(flags)
+        assert(not C.Closed,"Hub is unloaded.")
+        assert(type(flags)=="table","Invalid config.")
+        local data=copy(C.ConfigDefaults)
+        local count=0
+        local size
+        for flag,entry in pairs(flags)do
+            if flag==prefix.."WindowSize"then
+                assert(type(entry)=="table"and entry.Type=="WindowSize"and type(entry.Value)=="table","Invalid window size.")
+                size=entry.Value
+                for _,key in ipairs({"Width","Height"})do
+                    local value=size[key]
+                    assert(type(value)=="number"and value==value and value>=1 and value<=10000,"Invalid window size.")
+                end
+            else
+                local control=C.NativeConfigFlags[flag]
+                assert(control and type(entry)=="table" and entry.Type==control._type,"Incompatible config setting.")
+                local id=flag:sub(#prefix+1)
+                data.Settings[id]=copy(entry.Value)
+                -- Missing Value must fail validation, never inherit an ON setting.
+                assert(entry.Value~=nil,"Missing config value: "..id)
+                count+=1
+            end
         end
-    else self.Config.SaveError=nil;self.Config.Warned=false end
+        assert(count>0,"This config has no Stand Upright settings.")
+        C:Validate(data) -- Validate everything before stopping the current jobs.
+        return data,size
+    end
+    function window:_applyFlags(flags,silent)
+        local data,size=configData(flags)
+        C:Apply(data)   -- Sync every control, dropdown label and backend first.
+        if size then self:SetSize(Vector2.new(size.Width,size.Height),true)end
+        if silent~=true then C:ResumeConfiguredJobs()end
+    end
+    local nativeLoad=window.LoadConfig
+    function window:LoadConfig(name,silent)
+        name=name or self.ConfigName
+        if not self:ConfigExists(name)then return false,"Config is unavailable."end
+        local ok,loaded,err=pcall(function()
+            local raw=readfile(self.ConfigFolder.."/"..name..".json")
+            assert(type(raw)=="string"and #raw<=65536,"Config is too large.")
+            return nativeLoad(self,name,silent)
+        end)
+        if not ok then return false,tostring(loaded)end
+        return loaded,err
+    end
+    local nativeImport=window.ImportConfig
+    function window:ImportConfig(code,name,allowForeignFolder)
+        if type(code)~="string"or #code>65536 then return false,"Config code is too large or invalid."end
+        local flags,decodeError=self:DecodeConfig(code)
+        if not flags then return false,decodeError end
+        local valid,validationError=pcall(configData,flags)
+        if not valid then return false,tostring(validationError)end
+        local ok,imported,err,importName=pcall(nativeImport,self,code,name,allowForeignFolder)
+        if not ok then return false,tostring(imported)end
+        return imported,err,importName
+    end
+    function window:ResetConfig()
+        C:Apply(copy(C.ConfigDefaults))
+        self._pendingFlags={}
+        self:_configChanged()
+        return true
+    end
+    window:OnConfigChanged(function()
+        C.Config.Loaded=window.LoadedConfig
+        C.Config.Autoload=window:GetAutoload()
+    end)
 end
 
 -- Rejoin is explicit/opt-in. Sending a request is not proof of reaching another server.
+-- Only the two observed entry buttons are allowed; never match arbitrary "Play" text.
+function C:MenuObjectVisible(object)
+    if not object or not object:IsDescendantOf(player.PlayerGui)then return false end
+    local node=object
+    while node and node~=player.PlayerGui do
+        if node:IsA("GuiObject")and not node.Visible then return false end
+        if node:IsA("ScreenGui")and not node.Enabled then return false end
+        node=node.Parent
+    end
+    return true
+end
+function C:MenuEntryStep(job)
+    if self.Closed or job.Cancelled or not self.Settings.AutoPlay then return false,"Off"end
+    local pg=player:FindFirstChild("PlayerGui")
+    local loaded=player:FindFirstChild("LoadedIn")
+    if not pg or not loaded or not loaded.Value then return false,"Waiting for game to load"end
+    local changelog=pg:FindFirstChild("Changelogs")
+    local menu=pg:FindFirstChild("MenuGUI")
+    local phase,button
+    if self:MenuObjectVisible(changelog)then
+        phase="Close"
+        local frame=changelog:FindFirstChild("Frame")
+        if frame and self:MenuObjectVisible(frame)then
+            button=frame:FindFirstChild("TextButton")
+        end
+    end
+    if not phase then
+        local play=menu and menu:FindFirstChild("Play")
+        if self:MenuObjectVisible(menu)then
+            phase="Play";button=play
+        else
+            job.MenuAttempt=nil
+            return false,menu and "In game; waiting for the next menu"or "Waiting for the game menu"
+        end
+    end
+    if not button or not button:IsA("TextButton")or not self:MenuObjectVisible(button)then
+        return false,phase=="Close"and "Waiting for Close button"or "Waiting for Play button"
+    end
+    local text=button.Text:lower():match("^%s*(.-)%s*$")
+    if text~=(phase=="Close"and "close"or "play")then return false,"Waiting for the game menu"end
+    local attempt=job.MenuAttempt
+    if not attempt or attempt.Button~=button or attempt.Phase~=phase then
+        attempt={Button=button,Phase=phase,Count=0,NextAt=0};job.MenuAttempt=attempt
+    end
+    if attempt.Count>=3 then return false,"Menu did not respond; toggle Auto enter game off and on to retry"end
+    if os.clock()<attempt.NextAt then return false,phase=="Close"and "Waiting for changelog to close"or "Waiting to enter the game"end
+    -- Both real buttons bind MouseButton1Click; do not fire Activated as well.
+    if type(firesignal)~="function"then return false,"This executor cannot press menu buttons"end
+    attempt.Count+=1
+    attempt.NextAt=os.clock()+2^(attempt.Count-1)
+    local ok=pcall(firesignal,button.MouseButton1Click)
+    if not ok then return false,"Menu click failed; waiting to retry"end
+    self.MenuEntryStats=self.MenuEntryStats or {Close=0,Play=0}
+    self.MenuEntryStats[phase]+=1
+    return true,phase=="Close"and "Closing changelog"or "Pressing Play"
+end
 function C:OnRejoinFailure(who,placeId)
     local transition=self.Session.Transition
     if self.Closed or who~=player or placeId~=game.PlaceId or not transition or not transition.Pending then return end
@@ -2405,8 +2457,8 @@ local ok, failure = xpcall(function()
         C.LairStats.StartAt=nil
         C:EnqueueWebhook(C:WebhookEvent(reward,false),game.JobId..":lair:"..tostring(C.LairStats.Clears),false)
     end)
-    -- Pinned Airflow UI. Its config manager, theme manager and sidebar
-    -- config/theme managers stay off; this hub keeps its own configs and appearance.
+    -- Pinned Airflow UI; native autoload uses the hub's validated config adapter.
+    -- Keep one config UI and retain the existing typed schema and appearance.
     -- The native sidebar profile shares the Home identity/privacy controls.
     local uiSource=C.RuntimeCache.AirflowSource
     if C.RuntimeCache.AirflowRevision~=UI_REVISION or type(uiSource)~="string"then
@@ -2426,7 +2478,8 @@ local ok, failure = xpcall(function()
         Parent = player:WaitForChild("PlayerGui"), ToggleUIKeybind = "RightControl",
         Size = UDim2.fromOffset(920, 610), AdaptiveSize = false, UIScale = 1.1,
         MinSize = Vector2.new(880, 420), MaxSize = Vector2.new(1200, 950),
-        ConfigurationSaving = {Enabled = false, FolderName = STORAGE},
+        ConfigurationSaving = {Enabled = false, FolderName = STORAGE .. "/Airflow"},
+        SaveSize = "BlizzardStandUpright_WindowSize",
         Home = {Name = "Home", Title = "Blizzard Hub", Tier = false,
             Stats = {"Players", "Session", "FPS", "Ping"}, StatsFolder = STORAGE,
             Discord = "https://discord.gg/Tgjuuh8fh", Features = false},
@@ -2771,6 +2824,12 @@ local ok, failure = xpcall(function()
     local _, toolsGroup = tab("Tools")
     local safety = toolsGroup("Safety and display")
     local sessionGroup=toolsGroup("Session","Right")
+    textRow(sessionGroup,"Close the changelog, then press Play when the game menu appears.")
+    toggle(sessionGroup,"AutoPlay","Auto enter game",function(value)
+        if not value then C:StopJob("AutoPlay");return end
+        C:StartJob("AutoPlay",function(job)return C:MenuEntryStep(job)end,function()return 0.3 end)
+    end)
+    local menuEntryStatus=textRow(sessionGroup,"Off")
     textRow(sessionGroup, "Rejoin after the time you choose. This leaves your current server; jobs pause first. Rejoining is still being tested.")
     local sessionStatus=textRow(sessionGroup, "Off")
     C.Controls.RejoinMinutes=sessionGroup:CreateSlider({Range = {1, 1440},
@@ -2960,47 +3019,13 @@ local ok, failure = xpcall(function()
     toggle(appearance,"Snow","Falling snow",function(value)window:SetWeather(value and "Snow" or "None")end)
     C.Controls.SnowArea=appearance:CreateDropdown({Name="Snow area",Options={"Window","Screen"},CurrentOption="Window",
         Callback=function(value)C.Settings.SnowArea=value=="Window" and "UI" or "Screen";window:SetWeatherMode(C.Settings.SnowArea)end})
-    textRow(appearance, "Theme, size and snow are saved with your profile. Snow hides when the hub is closed.")
+    textRow(appearance, "Theme, size and snow are saved with your config. Snow hides when the hub is closed.")
     button(appearance,"Reset appearance",function()C:SetAppearancePreset("Blizzard");notify("Appearance reset.")end)
-    local configs = settingsGroup("Configs")
-    local name, imported = "", ""
-    configs:CreateInput({Name = "Config name", CurrentValue = "", Callback = function(v) name = v end})
-    local selector = configs:CreateDropdown({Name = "Saved configs", Options = {}, AllowNone = true, Callback = function(v) if v then name = v end end})
-    local function refresh() local names = C:ProfileNames(); selector:Refresh(names, true, true) end
-    button(configs, "Refresh", refresh)
-    button(configs, "Create", function() C:SaveProfile(name, true); refresh(); notify("Config created.") end)
-    button(configs, "Save", function() assert(isfile(profilePath(name)), "Create the config first."); C:SaveProfile(name, false); notify("Config saved.") end)
-    button(configs, "Load", function() C:LoadProfile(name); notify("Config loaded. Use Resume to start selected jobs.") end)
-    button(configs,"Resume selected jobs",function()C:ResumeConfiguredJobs();notify("Selected jobs resumed.")end)
-    local deleteName, deleteAt
-    button(configs, "Delete (click twice)", function()
-        prepareDirectories(); local path = profilePath(name)
-        if deleteName ~= name or not deleteAt or os.clock()-deleteAt > 5 then
-            deleteName = name; deleteAt = os.clock(); notify("Click Delete again within 5 seconds to confirm."); return
-        end
-        delfile(path); assert(not isfile(path), "Config deletion failed.")
-        if C.Config.Loaded == name then C.Config.Loaded = nil end
-        if C.Config.Autoload == name then C:SetAutoloadProfile(nil) end
-        deleteName = nil; refresh(); notify("Config deleted.")
-    end)
-    button(configs, "Export to clipboard", function() assert(type(setclipboard)=="function", "Clipboard is unavailable."); setclipboard(Http:JSONEncode(C:Snapshot())); notify("Config copied.") end)
-    configs:CreateInput({Name = "Import JSON", CurrentValue = "", Callback = function(v) imported = v end})
-    button(configs, "Import as new config", function() C:ImportProfile(name, imported); refresh(); notify("Config imported.") end)
-    if fileAPI then refresh() else textRow(configs, "Executor file APIs are unavailable.") end
-    local preferences=settingsGroup("Autoload","Right")
-    textRow(preferences, "Load your selected config when the hub opens. Farming stays paused until you press Resume.")
-    local autoloadStatus=textRow(preferences, "Autoload: Off")
-    toggle(preferences,"ProfileAutosave","Autosave loaded config",function(value)
-        local success,err=pcall(function()C:SetAutosave(value)end)
-        if not success then
-            C.Applying=true;C.Controls.ProfileAutosave:Set(C.Config.Autosave, true);C.Applying=false;notify(tostring(err))
-        end
-    end,false)
-    button(preferences,"Autoload selected config",function()
-        C:SetAutoloadProfile(name);autoloadStatus:SetText("Autoload: "..name)
-        notify("Autoload enabled. Jobs still require Resume.")
-    end)
-    button(preferences,"Disable autoload",function()C:SetAutoloadProfile(nil);autoloadStatus:SetText("Autoload: Off");notify("Autoload disabled.")end)
+    C:InstallNativeConfigs(window,Airflow)
+    local configs=settingsGroup("Configs")
+    textRow(configs,"Save your setup, then Set autoload. Saved ON features start when the hub opens.")
+    C.ConfigManager=configs:CreateConfigManager({Name="Configs"})
+    if not fileAPI then textRow(configs,"Executor file storage is unavailable.")end
     local layout = settingsGroup("Layout", "Right")
     local defaultPosition = mainFrame.Position
     button(layout, "Reset Layout", function()
@@ -3073,6 +3098,8 @@ local ok, failure = xpcall(function()
         local flyJob=C.Jobs.Fly;local speedJob=C.Jobs.SpeedBoost
         mobilityStatus:SetText("Fly: "..(flyJob and flyJob.Reason or "Off").."\nSpeed: "..(speedJob and speedJob.Reason or "Off"))
         C:PollRejoin()
+        local entryJob=C.Jobs.AutoPlay
+        menuEntryStatus:SetText(entryJob and entryJob.Reason or "Off")
         local sessionText=C.Session.Status
         if C.Settings.AutoRejoin and not C.JobArmed.AutoRejoin and not C.Session.Transition then sessionText="Paused; use Resume"end
         sessionStatus:SetText(sessionText)
@@ -3098,19 +3125,23 @@ local ok, failure = xpcall(function()
         local chosen=C.Settings.LairWebhook or C.Settings.LevelWebhook
         local webhookReason=chosen and(C.WebhookArmed and ws.Status or "Paused; use Resume")or ws.Status
         webhookStatus:SetText(webhookReason.."\nQueue "..#ws.Queue.." | Sent "..ws.Sent.." | Failed "..ws.Failed)
-        autoloadStatus:SetText("Autoload: "..(C.Config.Autoload or "Off"))
-        C:PollAutosave()
     end)
-    local preferencesOk,preferencesError=pcall(function()C:ReadPreferences()end)
-    if not preferencesOk then notify("Config preferences could not be read.");C.Config.PreferenceError=tostring(preferencesError)end
-    C.Applying=true;C.Controls.ProfileAutosave:Set(C.Config.Autosave, true);C.Applying=false
-    if C.Config.Autoload then
-        autoloadStatus:SetText("Autoload: "..C.Config.Autoload)
-        local loaded,err=pcall(function()C:LoadProfile(C.Config.Autoload)end)
-        if not loaded then C.Config.AutoloadError=tostring(err);notify("Autoload config could not be loaded.")end
-    end
     C:ApplyAppearance()
     window:SelectTab(home); C.Ready = true;bootReceipt.State="Ready"
+    if fileAPI then
+        local autoloadOk,autoloadError=pcall(function()
+            local name=window:GetAutoload()
+            C.Config.Autoload=name
+            if name then
+                local loaded,err=window:LoadAutoload()
+                if not loaded then C.Config.AutoloadError=tostring(err)end
+            end
+        end)
+        if not autoloadOk then
+            C.Config.AutoloadError=tostring(autoloadError)
+            notify("Autoload could not be read. Check your saved config.")
+        end
+    end
 end, debug.traceback)
 if not ok then bootReceipt.State="Failed";C.BootError = failure; C:Cleanup(); error(failure) end
 return C
