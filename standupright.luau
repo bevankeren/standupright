@@ -1,7 +1,7 @@
 -- Blizzard Hub / Stand Upright: Rebooted
--- Version 1.0.1. Public distribution is separate; no Auto Execute.
+-- Version 1.0.2. Public distribution is separate; no Auto Execute.
 -- Stand actions are bound from the character's native input source, never guessed.
-local VERSION = "1.0.1"
+local VERSION = "1.0.2"
 -- Pinned Airflow UI (joustingmatch/-3, fork of PookiePepelsss/Airflow-UI).
 local UI_REVISION = "3d74124f1d3fbc653cef118088c006b394b87867"
 local UI_URL = "https://raw.githubusercontent.com/joustingmatch/-3/" .. UI_REVISION .. "/Source.luau"
@@ -461,10 +461,19 @@ function C:AttachUnderTarget(target, job, owner, skipBring)
     return true,"Attached below target"
 end
 function C:HasNPCControl(root,playerRoot)
-    if type(gethiddenproperty)~="function"or not root or root.Anchored or not playerRoot then return false end
-    local a,own=pcall(gethiddenproperty,playerRoot,"NetworkOwnerV3")
-    local b,peer=pcall(gethiddenproperty,root,"NetworkOwnerV3")
-    return a and b and type(own)=="number"and own>1 and peer==own
+    if not root or not playerRoot then return false,false end
+    if type(isnetworkowner)=="function" then
+        local ok,owned=pcall(isnetworkowner,root)
+        if ok and type(owned)=="boolean" then return not root.Anchored and owned,true end
+    end
+    if type(gethiddenproperty)=="function" then
+        local a,own=pcall(gethiddenproperty,playerRoot,"NetworkOwnerV3")
+        local b,peer=pcall(gethiddenproperty,root,"NetworkOwnerV3")
+        if a and b and type(own)=="number"and type(peer)=="number" then
+            return not root.Anchored and own>1 and peer==own,true
+        end
+    end
+    return false,false -- Unsupported is different from a supported check reporting no ownership.
 end
 function C:ReleaseBring(owner)
     local state=self.BringState
@@ -560,14 +569,24 @@ function C:BringTarget(target,job,owner)
                 item.LastApplied=cf;count+=1
             end
         end
-        if not self:HasNPCControl(primary.Root,root)then job.Reason="Waiting: NPC control lost";return end
-        local position=primary.Root.Position-primary.Root.CFrame.LookVector*(move.BehindDistance or 4)
-        local cf=CFrame.lookAt(position,primary.Root.Position)
+        -- Keep the player at the underground anchor even if the server corrects the mob upward.
+        -- Never derive player Y from the mob's replicated/rollback position.
+        local slot=primary.Slot
+        local held=state.Anchor*CFrame.new((slot%3-1)*5,0,-math.floor(slot/3)*5)
+        local position=held.Position-held.LookVector*(move.BehindDistance or 4)
+        local cf=CFrame.lookAt(position,held.Position)
         move.Humanoid.AutoRotate=false;move.AppliedAutoRotate=false;self:MaintainCollisions()
         root.CFrame=cf;root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
         if state.Platform then state.Platform.CFrame=CFrame.new(position-Vector3.new(0,root.Size.Y/2+move.Humanoid.HipHeight+.5,0))end
-        if not self.Settings.Noclip and move.Humanoid:GetState()==Enum.HumanoidStateType.Freefall then move.Humanoid:ChangeState(Enum.HumanoidStateType.Running)end
+        local humanoidState=move.Humanoid:GetState()
+        if not self.Settings.Noclip and not move.Humanoid.PlatformStand and not move.Humanoid.Sit
+            and (humanoidState==Enum.HumanoidStateType.Freefall or humanoidState==Enum.HumanoidStateType.GettingUp) then
+            move.Humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end
         move.LastApplied=cf;state.Count=count
+        if not self:HasNPCControl(primary.Root,root)then
+            job.Reason="Waiting underground for the mob";self:ReleaseInputs(owner);return
+        end
     end
     if not move.AttachConnection then move.AttachConnection=RunService.Heartbeat:Connect(follow)end
     follow()
@@ -647,7 +666,15 @@ function C:EnsureCombatStand(target,owner)
         state={Character=player.Character,Owner=owner,Attempts=0,NextAt=0};self.CombatSummon=state
     end
     if os.clock()<state.NextAt then return false,"Attached below: waiting for summon"end
-    if state.Attempts>=3 then return false,"Stand did not summon; stop and retry"end
+    if state.Attempts>=3 then
+        state.Batches=(state.Batches or 0)+1
+        if state.Batches>=3 then
+            local job=self.Jobs[owner];if job then job.Cancelled=true end
+            return false,"Stand could not summon. Turn farming off and on to retry."
+        end
+        state.Attempts=0;state.NextAt=os.clock()+8
+        return false,"Waiting for the stand to recover"
+    end
     local fired,reason=self:UseSkill("Summon",target,owner)
     if fired then state.Attempts+=1;state.NextAt=os.clock()+3 end
     return false,fired and "Attached below: summoning stand"or reason
@@ -670,10 +697,24 @@ function C:FarmTargetStep(target,job,owner)
     self:ObserveFarmDamage(job)
     if job.Target~=target then
         job.Target=target;job.Health=humanoid.Health;job.ProgressAt=os.clock();job.Stalls=0;job.RetryAt=nil;job.RangeAdjusted=nil;job.AttackAt=nil
+        job.BringControlWaitAt=nil;job.BringFallbackTarget=nil
     end
     job.Health=math.max(0,humanoid.Health)
     if job.RetryAt and os.clock()<job.RetryAt then return false,"Waiting before retry" end
-    local inRange,reason=self:AttachUnderTarget(target,job,owner)
+    local targetRoot=target:FindFirstChild("HumanoidRootPart")
+    local controlled,controlSupported=self:HasNPCControl(targetRoot,player.Character and player.Character:FindFirstChild("HumanoidRootPart"))
+    if owner=="AutoFarmLevel" and not controlled then
+        job.BringControlWaitAt=job.BringControlWaitAt or os.clock()
+        if not controlSupported or os.clock()-job.BringControlWaitAt>=8 then job.BringFallbackTarget=target end
+    elseif controlled then job.BringControlWaitAt=nil end
+    -- Sticky per target: do not bounce between 20-stud bring and 5-stud farming when ownership flickers.
+    local fallback=owner=="AutoFarmLevel" and job.BringFallbackTarget==target
+    if fallback and self.BringState and self.BringState.Owner==owner then
+        if self.Movement and self.Movement.AttachConnection then self.Movement.AttachConnection:Disconnect();self.Movement.AttachConnection=nil end
+        self:ReleaseBring(owner)
+        if self.Movement then self.Movement.Behind=nil end
+    end
+    local inRange,reason=self:AttachUnderTarget(target,job,owner,fallback)
     if not inRange then job.ProgressAt=os.clock();return false,reason end
     local summoned,summonReason=self:EnsureCombatStand(target,owner)
     if not summoned then job.ProgressAt=os.clock();return false,summonReason end
@@ -696,7 +737,7 @@ function C:FarmTargetStep(target,job,owner)
     end
     local fired,message=self:UseSkill("M1",target,owner)
     if fired then job.AttackAt=os.clock()end
-    return fired,fired and ("Attacking "..target.Name..string.format(" | Damage %.1f",job.ConfirmedDamage or 0)) or message
+    return fired,fired and ("Attacking "..target.Name..(fallback and " | Farming below mob" or "")..string.format(" | Damage %.1f",job.ConfirmedDamage or 0)) or message
 end
 local function inLair()
     local character = player.Character
@@ -947,9 +988,20 @@ function C:AutoFarmLevelStep(job)
                 self:TrackLevelQuest(job,q);quest=v
             end
         end
-        -- Only the first quest identity has been independently observed on this fresh account.
-        if not quest and level<10 then local q=player.Data.Quests:FindFirstChild("KillBadGi")
-            local v=self:ReadLevelQuest(q);if v and v.Enemy=="Bad Gi"and not v.Completed then self:TrackLevelQuest(job,q);job.NPC=npc;quest=v end
+        -- A single existing kill quest is safe to resume from its replicated target/counter.
+        -- Do not abandon quests or guess among multiple active tasks after a reconnect.
+        if not quest then
+            local existing
+            for _,q in ipairs(player.Data.Quests:GetChildren())do
+                local v=self:ReadLevelQuest(q)
+                if v and not v.Completed then
+                    if existing then job.Cancelled=true;return false,"Several kill quests are active. Finish one before starting level farming." end
+                    existing=v
+                end
+            end
+            if existing then
+                job.NPC=npc;self:TrackLevelQuest(job,existing.Instance);quest=existing;job.QuestProgressAt=os.clock()
+            end
         end
     end
     if job.Quest and(not quest or quest.Completed)then
