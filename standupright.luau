@@ -1,7 +1,7 @@
 -- Blizzard Hub / Stand Upright: Rebooted
--- Version 1.0.6. Public distribution is separate; no Auto Execute.
+-- Version 1.0.7. Public distribution is separate; no Auto Execute.
 -- Stand actions are bound from the character's native input source, never guessed.
-local VERSION = "1.0.6"
+local VERSION = "1.0.7"
 -- Pinned Airflow UI (joustingmatch/-3, fork of PookiePepelsss/Airflow-UI).
 local UI_REVISION = "3d74124f1d3fbc653cef118088c006b394b87867"
 local UI_URL = "https://raw.githubusercontent.com/joustingmatch/-3/" .. UI_REVISION .. "/Source.luau"
@@ -78,7 +78,7 @@ C.WebhookURL="";C.WebhookArmed=false;C.WebhookArmedEvents={};C.WebhookLevelSeque
 C.CollisionScopes={};C.CollisionLeases=setmetatable({}, {__mode="k"})
 C.MerchantCatalogue={}
 C.NpcPromptEpoch=0
-C.Session={Deadline=nil,Transition=nil,Status="Off"}
+C.Session={Transition=nil,Status="Off"}
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
     table.insert(C.Connections, connection)
@@ -1690,7 +1690,7 @@ function C:StartJob(id, step, delay)
         while not self.Closed and not job.Cancelled and self.Settings[id] do
             job.Active = false
             if not networkReady()then self.DisconnectReason="Game server disconnected";self:Cleanup();break
-            elseif id~="AutoPlay"and not alive() then job.Reason = "Waiting for character"
+            elseif id~="AutoPlay"and id~="AutoRejoin"and not alive() then job.Reason = "Waiting for character"
             elseif UserInputService:GetFocusedTextBox() then job.Reason = "Waiting for text input"
             else
                 local ok, active, reason = pcall(step, job)
@@ -1721,7 +1721,10 @@ function C:StartJob(id, step, delay)
     end)
 end
 function C:StopEverything()
-    self.Session.Deadline=nil
+    local transition=self.Session.Transition
+    if transition and transition.Pending and transition.State=="Searching"then
+        transition.Pending=false;transition.State="Cancelled"
+    end
     if not self.Session.Transition or not self.Session.Transition.Pending then self.Session.Status="Off"end
     for id in pairs(self.Tasks)do self:StopTask(id)end
     self:ClearWebhookQueue();self.WebhookArmed=false;table.clear(self.WebhookArmedEvents)
@@ -1770,7 +1773,6 @@ function C:Cleanup()
     for _, connection in ipairs(self.Connections) do connection:Disconnect() end
     table.clear(self.Connections)
     if self.Library and not self.Library.Unloaded then self.Library:Unload() end
-    if self.MobileUI then self.MobileUI:Destroy() end
     if self.UI and self.UI.Parent then self.UI:Destroy() end
     self.LastSafe = nil
     if self.DisconnectReason then self.RuntimeCache.Bindings={} end
@@ -1860,11 +1862,6 @@ function C:ApplyAppearance()
     end
     -- The toggle adapter repaints ON state from the real toggle value, never hover or theme.
     if self.RefreshToggleState then self:RefreshToggleState() end
-    if self.MobileButton then
-        self.MobileButton.BackgroundColor3=surface
-        self.MobileButton.TextColor3=text
-    end
-    if self.MobileStroke then self.MobileStroke.Color=accent end
     local wasApplying=self.Applying;self.Applying=true
     for _,id in ipairs({"AppearancePreset","AccentHex","SurfaceHex"}) do
         local control=self.Controls[id]
@@ -2187,8 +2184,8 @@ function C:OnRejoinFailure(who,placeId)
     local transition=self.Session.Transition
     if self.Closed or who~=player or placeId~=game.PlaceId or not transition or not transition.Pending then return end
     transition.Pending=false;transition.State="Failed"
-    self.Session.Status="Rejoin failed; jobs remain paused. Resume or retry manually."
-    if self.Library then self.Library:Notify({Title="Rejoin failed",Description="Jobs remain paused. Resume or retry manually.",Time=5})end
+    self.Session.Status="Server hop failed; toggle your features off and on to resume."
+    if self.Library then self.Library:Notify({Title="Server hop failed",Description="Check Roblox, then turn your features off and on to resume.",Time=5})end
 end
 function C:ObserveRejoinState(state,placeId)
     local transition=self.Session.Transition
@@ -2196,58 +2193,122 @@ function C:ObserveRejoinState(state,placeId)
     if state==Enum.TeleportState.Failed then self:OnRejoinFailure(player,placeId)
     else
         transition.State=state.Name
-        self.Session.Status="Roblox teleport: "..state.Name..". Arrival is not yet confirmed."
+        self.Session.Status="Server hop: "..state.Name..". Arrival is not yet confirmed."
     end
+end
+-- The game's native newStatsGUI ServerTime module reads Workspace.Age.
+-- DistributedGameTime and os.clock are client/session elapsed, not server age.
+function C:GetServerAge()
+    local value=workspace:FindFirstChild("Age")
+    if not value or not(value:IsA("NumberValue")or value:IsA("IntValue"))then return nil end
+    local age=value.Value
+    if type(age)~="number"or age~=age or age<0 or age==math.huge then return nil end
+    return age
+end
+function C:FindHopServer(info)
+    local cursor
+    local transport=request or http_request or(http and http.request)or(syn and syn.request)
+    for _=1,3 do
+        if self.Closed or info.Cancelled or not networkReady()then return nil,"Search cancelled"end
+        local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
+        if cursor then url..="&cursor="..Http:UrlEncode(cursor)end
+        local ok,response=pcall(function()
+            if type(transport)=="function"then return transport({Url=url,Method="GET",Timeout=10})end
+            return {StatusCode=200,Body=game:HttpGet(url)}
+        end)
+        if self.Closed or info.Cancelled or not networkReady()then return nil,"Search cancelled"end
+        if not ok or type(response)~="table"then return nil,"Cannot load the server list"end
+        if tonumber(response.StatusCode or response.Status)~=200 then return nil,"Server list is unavailable; try again later"end
+        if type(response.Body)~="string"or #response.Body>262144 then return nil,"Invalid server list"end
+        local decoded,data=pcall(Http.JSONDecode,Http,response.Body)
+        if not decoded or type(data)~="table"or type(data.data)~="table"or #data.data>100 then return nil,"Invalid server list"end
+        for _,server in ipairs(data.data)do
+            if type(server)=="table"and type(server.id)=="string"and #server.id==36
+                and server.id:match("^[%x%-]+$")and server.id~=game.JobId
+                and type(server.playing)=="number"and type(server.maxPlayers)=="number"
+                and server.playing>=0 and server.playing<server.maxPlayers then
+                return server.id
+            end
+        end
+        cursor=data.nextPageCursor
+        if type(cursor)~="string"or cursor==""or #cursor>1024 then break end
+    end
+    return nil,"No other server with space was found"
 end
 function C:RejoinSession(origin)
     if self.Closed or not networkReady()then return false,"Game server disconnected"end
     if game.PlaceId~=8540168650 or game.GameId~=3258251641 then return false,"Unsupported experience"end
-    if origin~="manual"and origin~="timer"then return false,"Invalid rejoin request"end
-    if origin=="timer"and(not self.Settings.AutoRejoin or not self.JobArmed.AutoRejoin)then return false,"Timer is paused"end
+    if origin~="manual"and origin~="timer"then return false,"Invalid server hop request"end
+    if origin=="timer"then
+        if not self.Settings.AutoRejoin or not self.JobArmed.AutoRejoin then return false,"Auto server hop is paused"end
+        local age=self:GetServerAge()
+        if not age then return false,"Waiting for server age"end
+        if age<self.Settings.RejoinMinutes*60 then return false,"Server has not reached the selected age"end
+    end
     local session=self.Session;local previous=session.Transition
-    if previous and previous.Pending then return false,"A rejoin request is already pending"end
-    if previous and os.clock()-previous.At<15 then return false,"Wait before requesting another rejoin"end
-    local transition={Pending=true,State="Requested",Origin=origin,At=os.clock(),FromJob=game.JobId}
-    session.Transition=transition;session.Deadline=nil;session.Status="Rejoin requested; waiting for Roblox"
-    -- Preserve chosen settings, but disarm jobs so a failed transition cannot silently restart them.
-    for id in pairs(self.Jobs)do self:StopJob(id)end
-    for id in pairs(self.Tasks)do self:StopTask(id)end
-    table.clear(self.JobArmed);self:ClearWebhookQueue();self.WebhookArmed=false;table.clear(self.WebhookArmedEvents)
-    self:ReleaseInputs();self:ReleaseMovement();self:ReleaseCollisions()
+    if previous and previous.Pending then return false,"A server hop is already pending"end
+    if previous and os.clock()-previous.At<15 then return false,"Wait before requesting another hop"end
+    local transition={Pending=true,State="Searching",Origin=origin,At=os.clock(),FromJob=game.JobId}
+    session.Transition=transition;session.Status="Finding another server"
+    -- Do not keep re-requesting while HTTP/Roblox is pending; other jobs continue
+    -- until an actual destination is found, then all inputs/movement are released.
+    self:StopJob("AutoRejoin");self.JobArmed.AutoRejoin=nil
     local info={Active=true,Cancelled=false,Started=os.clock()};self.Tasks.SessionTeleport=info
     info.Thread=task.spawn(function()
-        local valid=pcall(TeleportService.Teleport,TeleportService,game.PlaceId,player)
+        local destination,reason=self:FindHopServer(info)
+        if info.Cancelled or self.Closed or session.Transition~=transition then info.Active=false;return end
+        if origin=="timer"and not self.Settings.AutoRejoin then
+            info.Active=false;transition.Pending=false;transition.State="Cancelled";session.Status="Off";return
+        end
+        if not destination then
+            info.Active=false;transition.Pending=false;transition.State="SearchFailed"
+            session.Status=(reason or "Server search failed").."; turn Auto server hop off and on to retry"
+            return
+        end
+        if not networkReady()or game.JobId~=transition.FromJob then info.Active=false;return end
+        transition.DestinationJob=destination;transition.State="Requested"
+        session.Status="Server hop requested; waiting for Roblox"
+        for id in pairs(self.Jobs)do self:StopJob(id)end
+        for id in pairs(self.Tasks)do if id~="SessionTeleport"then self:StopTask(id)end end
+        table.clear(self.JobArmed);self:ClearWebhookQueue();self.WebhookArmed=false;table.clear(self.WebhookArmedEvents)
+        self:ReleaseInputs();self:ReleaseMovement();self:ReleaseCollisions()
+        local sent=pcall(TeleportService.TeleportToPlaceInstance,TeleportService,game.PlaceId,destination,player)
         if info.Cancelled or self.Closed or session.Transition~=transition then info.Active=false;return end
         info.Active=false
-        if not valid then self:OnRejoinFailure(player,game.PlaceId)
+        if not sent then self:OnRejoinFailure(player,game.PlaceId)
         elseif transition.Pending and transition.State=="Requested"then
-            transition.State="Dispatched";session.Status="Rejoin dispatched; arrival is not confirmed"
+            transition.State="Dispatched";session.Status="Server hop dispatched; arrival is not confirmed"
         end
     end)
-    return true,"Rejoin requested; jobs paused"
+    return true,"Finding another server"
 end
 function C:PollRejoin()
     if self.Closed then return end
     local transition=self.Session.Transition
-    if transition and transition.Pending and os.clock()-transition.At>30 then
+    if transition and transition.Pending and os.clock()-transition.At>45 then
         self:StopTask("SessionTeleport");transition.Pending=false;transition.State="Unconfirmed"
-        self.Session.Status="No confirmed transition; no automatic retry. Check Roblox before retrying."
+        self.Session.Status="No confirmed hop; no automatic retry. Check Roblox before retrying."
     end
+end
+function C:ServerAgeHopStep()
+    local age=self:GetServerAge()
+    if not age then self.Session.Status="Waiting for server age";return false,self.Session.Status end
+    local remaining=math.max(0,math.ceil(self.Settings.RejoinMinutes*60-age))
+    if remaining==0 then
+        local queued,reason=self:RejoinSession("timer")
+        if not queued then
+            self.Session.Status=reason;self:StopJob("AutoRejoin");self.JobArmed.AutoRejoin=nil
+        end
+        return false,self.Session.Status
+    end
+    local text=string.format("Server age: %dh %02dm | Hop in %dh %02dm %02ds",
+        math.floor(age/3600),math.floor(age/60)%60,math.floor(remaining/3600),math.floor(remaining/60)%60,remaining%60)
+    self.Session.Status=text;return true,text
 end
 function C:StartRejoinTimer()
     assert(not self.Closed and networkReady(),"Game server disconnected.")
-    if not self.Session.Deadline then self.Session.Deadline=os.clock()+self.Settings.RejoinMinutes*60 end
-    self.Session.Status="Timer armed"
-    self:StartJob("AutoRejoin",function()
-        local remaining=math.max(0,math.ceil((self.Session.Deadline or os.clock())-os.clock()))
-        if remaining==0 then
-            local queued,reason=self:RejoinSession("timer")
-            if not queued then self:StopJob("AutoRejoin");self.JobArmed.AutoRejoin=nil;self.Session.Status=reason end
-            return false,reason
-        end
-        local text=string.format("Rejoin in %dh %02dm %02ds",math.floor(remaining/3600),math.floor(remaining/60)%60,remaining%60)
-        self.Session.Status=text;return true,text
-    end,function()return 1 end)
+    self.Session.Status="Reading server age"
+    self:StartJob("AutoRejoin",function()return self:ServerAgeHopStep()end,function()return 1 end)
 end
 
 -- Webhook secrets stay in this runtime only; profiles contain opt-in flags, never URLs.
@@ -2830,25 +2891,28 @@ local ok, failure = xpcall(function()
         C:StartJob("AutoPlay",function(job)return C:MenuEntryStep(job)end,function()return 0.3 end)
     end)
     local menuEntryStatus=textRow(sessionGroup,"Off")
-    textRow(sessionGroup, "Rejoin after the time you choose. This leaves your current server; jobs pause first. Rejoining is still being tested.")
+    textRow(sessionGroup, "Hop to another server when this server reaches the age you choose. Missing server age pauses the timer. The next server may not be younger.")
     local sessionStatus=textRow(sessionGroup, "Off")
     C.Controls.RejoinMinutes=sessionGroup:CreateSlider({Range = {1, 1440},
-        Name="Rejoin interval",CurrentValue=120,Increment = 1,Suffix=" min",
+        Name="Hop at server age",CurrentValue=120,Increment = 1,Suffix=" min",
         Callback=function(value)
             C.Settings.RejoinMinutes=value
-            if not C.Applying and C.JobArmed.AutoRejoin and C.Session.Deadline then C.Session.Deadline=os.clock()+value*60 end
         end})
-    toggle(sessionGroup,"AutoRejoin","Timed rejoin",function(value)
+    toggle(sessionGroup,"AutoRejoin","Auto server hop",function(value)
         if value then C:StartRejoinTimer()
         else
-            C:StopJob("AutoRejoin");C.Session.Deadline=nil
+            C:StopJob("AutoRejoin");C.JobArmed.AutoRejoin=nil
+            local transition=C.Session.Transition
+            if transition and transition.Pending and transition.Origin=="timer"and transition.State=="Searching"then
+                C:StopTask("SessionTeleport");transition.Pending=false;transition.State="Cancelled"
+            end
             if not C.Session.Transition or not C.Session.Transition.Pending then C.Session.Status="Off"end
         end
     end)
     local rejoinConfirmAt
-    button(sessionGroup,"Rejoin now (click twice)",function()
+    button(sessionGroup,"Server hop now (click twice)",function()
         if not rejoinConfirmAt or os.clock()-rejoinConfirmAt>5 then
-            rejoinConfirmAt=os.clock();notify("Click again within 5 seconds to leave this server and rejoin.");return
+            rejoinConfirmAt=os.clock();notify("Click again within 5 seconds to move to a different server.");return
         end
         rejoinConfirmAt=nil;local queued,reason=C:RejoinSession("manual");assert(queued,reason);notify(reason)
     end)
@@ -3034,22 +3098,6 @@ local ok, failure = xpcall(function()
         notify("Layout reset.")
     end)
     button(layout, "Unload", function() C:Cleanup() end)
-    local mobile = Instance.new("ScreenGui")
-    mobile.Name = "BlizzardStandUprightMobileUI"; mobile.ResetOnSpawn = false; mobile.DisplayOrder = C.UI.DisplayOrder + 1
-    mobile.Parent = player.PlayerGui; C.MobileUI = mobile
-    local appearanceColors = C.Appearance or {}
-    local open = Instance.new("TextButton")
-    open.Name = "BlizzardStandUprightMobileButton"; open.Size = UDim2.fromOffset(76,44)
-    open.Position = UDim2.new(0,12,0.5,-22); open.Text = "Blizzard"; open.Font = Enum.Font.GothamMedium
-    open.TextSize = 15; open.AutoButtonColor = false
-    open.BackgroundColor3 = appearanceColors.Surface or Color3.fromRGB(16,17,24)
-    open.TextColor3 = appearanceColors.Text or Color3.fromRGB(225,229,235)
-    open.Visible = UserInputService.TouchEnabled; open.Parent = mobile; C.MobileButton=open
-    local mobileCorner = Instance.new("UICorner"); mobileCorner.CornerRadius = UDim.new(0, 10); mobileCorner.Parent = open
-    local mobileStroke = Instance.new("UIStroke"); mobileStroke.Thickness = 1
-    mobileStroke.Color = appearanceColors.Accent or Color3.fromRGB(100,205,215); mobileStroke.Parent = open
-    C.MobileStroke = mobileStroke
-    connect(open.Activated, function() window:Toggle() end)
     -- Airflow keeps the window clamped on screen; the header and Reset Layout stay reachable.
     -- Complete reference inventory retained; these handlers are not yet implemented/verified.
     local pending = {
@@ -3057,7 +3105,7 @@ local ok, failure = xpcall(function()
         {"Roll", "Auto roll; 2x orb; storage; safe zone; stand/attribute/Kars modes; arrow/Rokakaka selection; delay; target stands/attributes; blacklist; specific stand-attribute pairs"},
         {"Lair", "All-difficulty gameplay QC; instant kill and delay; webhook delivery QC"},
         {"Shop", "Merchant preview gameplay QC; regular auto buy; stock item/amount; auto buy/sell; sell-at price"},
-        {"Tools", "Pickup gameplay QC; open storage; anti time stop; anti ragdoll; infinite Hamon; shutdown hop; server hop; genuine rejoin arrival QC; reset timer/manual"},
+        {"Tools", "Pickup gameplay QC; open storage; anti time stop; anti ragdoll; infinite Hamon; server-hop destination age selection; genuine hop arrival QC; reset timer/manual"},
         {"Webhook", "Roll events and target-only/all mode; genuine Discord delivery QC"},
         {"Settings", "Appearance runtime QC; Auto Execute"},
     }
@@ -3101,7 +3149,7 @@ local ok, failure = xpcall(function()
         local entryJob=C.Jobs.AutoPlay
         menuEntryStatus:SetText(entryJob and entryJob.Reason or "Off")
         local sessionText=C.Session.Status
-        if C.Settings.AutoRejoin and not C.JobArmed.AutoRejoin and not C.Session.Transition then sessionText="Paused; use Resume"end
+        if C.Settings.AutoRejoin and not C.JobArmed.AutoRejoin and not C.Session.Transition then sessionText="Auto server hop paused; turn it off and on to retry"end
         sessionStatus:SetText(sessionText)
         local merchantTask=C.Tasks.MerchantPreview
         merchantStatus:SetText(merchantTask and(merchantTask.Cancelled and "Preview stopped"or merchantTask.Reason)or "Select a merchant and preview its catalogue.")
