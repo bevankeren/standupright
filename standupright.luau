@@ -1,7 +1,7 @@
 -- Blizzard Hub / Stand Upright: Rebooted
--- Version 1.0.7. Public distribution is separate; no Auto Execute.
+-- Version 1.0.8. Public distribution is separate; no Auto Execute.
 -- Stand actions are bound from the character's native input source, never guessed.
-local VERSION = "1.0.7"
+local VERSION = "1.0.8"
 -- Pinned Airflow UI (joustingmatch/-3, fork of PookiePepelsss/Airflow-UI).
 local UI_REVISION = "3d74124f1d3fbc653cef118088c006b394b87867"
 local UI_URL = "https://raw.githubusercontent.com/joustingmatch/-3/" .. UI_REVISION .. "/Source.luau"
@@ -16,7 +16,7 @@ local TeleportService = game:GetService("TeleportService")
 local function networkReady()
     return NetworkClient:FindFirstChildOfClass("ClientReplicator")~=nil
 end
-local JOB_IDS = {"AutoFarmLevel", "AutoSkill", "AutoFarmMob", "AutoLair", "AutoPickup", "AntiVoid", "Noclip", "AutoRejoin", "AutoPlay", "BringMob", "Fly", "SpeedBoost"}
+local JOB_IDS = {"AutoFarmLevel", "AutoSkill", "AutoFarmMob", "AutoLair", "AutoPickup", "AntiAFK", "AntiVoid", "Noclip", "AutoRejoin", "AutoPlay", "BringMob", "Fly", "SpeedBoost"}
 local player = assert(Players.LocalPlayer, "Local player is unavailable.")
 local env = getgenv()
 local bootReceipt={Version=VERSION,PlaceId=game.PlaceId,JobId=game.JobId,State="Starting"}
@@ -48,7 +48,7 @@ local C = {
         UIScale = 110, Snow = true, SnowArea = "UI",
         LairWebhook = false, LevelWebhook = false, WebhookHideName = true, Noclip = false,
         AutoQuestFarm = false, QuestId = "", MerchantNpc = "", MerchantOption = "",
-        AutoRejoin = false, RejoinMinutes = 120, AutoPlay=false, BringMob=false, BringDepth=20,
+        AutoRejoin = false, RejoinMinutes = 120, AutoPlay=false, AntiAFK=false, BringMob=false, BringDepth=20,
         Fly=false, FlySpeed=45, SpeedBoost=false, WalkSpeed=32},
     Config = {Loaded = nil, Autoload = nil},
     Evidence = {
@@ -1657,6 +1657,7 @@ function C:StopJob(id)
     if self.CombatSummon and self.CombatSummon.Owner==id then self.CombatSummon=nil end
     local job = self.Jobs[id]
     if job then
+        if job.IdleConnection then job.IdleConnection:Disconnect();job.IdleConnection=nil end
         if job.QuestConnections then for _,v in ipairs(job.QuestConnections)do v:Disconnect()end;job.QuestConnections=nil end
         job.StopRequested=true
         if job.StreamThread then pcall(task.cancel,job.StreamThread);job.StreamThread=nil end
@@ -1802,6 +1803,7 @@ SPEC.SurfaceHex = {kind="hex",role="surface"}
 SPEC.LairWebhook={kind="boolean"};SPEC.LevelWebhook={kind="boolean"};SPEC.WebhookHideName={kind="boolean"}
 SPEC.LairDistance={kind="number",min=6,max=12}
 SPEC.Noclip={kind="boolean"}
+SPEC.AntiAFK={kind="boolean"}
 SPEC.BringMob={kind="boolean"};SPEC.BringDepth={kind="number",min=10,max=60}
 SPEC.Fly={kind="boolean"};SPEC.FlySpeed={kind="number",min=10,max=120}
 SPEC.SpeedBoost={kind="boolean"};SPEC.WalkSpeed={kind="number",min=16,max=100}
@@ -2123,7 +2125,47 @@ function C:InstallNativeConfigs(window,airflow)
     end)
 end
 
--- Rejoin is explicit/opt-in. Sending a request is not proof of reaching another server.
+-- Event-driven anti-idle: one owned listener, no background clicking loop,
+-- no held mouse input across yields and no modification of other scripts' listeners.
+function C:AntiAFKIdle(job)
+    if self.Closed or job.Cancelled or self.Jobs.AntiAFK~=job
+        or not self.Settings.AntiAFK or not self.JobArmed.AntiAFK then return end
+    if not networkReady()then self.DisconnectReason="Game server disconnected";self:Cleanup();return end
+    if UserInputService:GetFocusedTextBox()then job.Reason="Waiting while you type";return end
+    local camera=workspace.CurrentCamera
+    if not camera then job.Reason="Waiting for the game camera";return end
+    local now=os.clock()
+    if job.LastPulseAt and now-job.LastPulseAt<60 then return end
+    job.LastPulseAt=now;job.Active=true
+    local ok,err=pcall(function()
+        local controller=game:GetService("VirtualUser")
+        controller:CaptureController()
+        controller:ClickButton2(Vector2.new(0,0),camera.CFrame)
+    end)
+    job.Active=false;job.Ticks+=1
+    if ok then
+        job.Pulses+=1;job.Failures=0;job.Error=nil
+        job.Reason="On; idle input sent"
+    else
+        job.Failures+=1;job.Error=tostring(err)
+        job.Reason="Anti-AFK input unavailable; waiting to retry"
+        if job.Failures>=3 then
+            self:StopJob("AntiAFK");self.JobArmed.AntiAFK=nil
+            job.Reason="Anti-AFK unavailable; turn it off and on to retry"
+            if self.Library then self.Library:Notify({Title="Anti-AFK unavailable",Description="This executor could not send the idle input.",Time=5})end
+        end
+    end
+end
+function C:StartAntiAFK()
+    assert(not self.Closed,"Hub is unloaded.")
+    self:StopJob("AntiAFK")
+    if not self.Settings.AntiAFK then return end
+    local job={Cancelled=false,Active=false,Reason="On; waiting for idle",Ticks=0,Pulses=0,Failures=0}
+    self.Jobs.AntiAFK=job;self.JobArmed.AntiAFK=true
+    job.IdleConnection=player.Idled:Connect(function()self:AntiAFKIdle(job)end)
+end
+
+-- Server hopping is explicit/opt-in. A request is not proof of arrival.
 -- Only the two observed entry buttons are allowed; never match arbitrary "Play" text.
 function C:MenuObjectVisible(object)
     if not object or not object:IsDescendantOf(player.PlayerGui)then return false end
@@ -2884,6 +2926,12 @@ local ok, failure = xpcall(function()
     textRow(merchant, "Returns you after the preview. Stock trading is not available yet.")
     local _, toolsGroup = tab("Tools")
     local safety = toolsGroup("Safety and display")
+    toggle(safety,"AntiAFK","Anti-AFK",function(value)
+        if not value then C:StopJob("AntiAFK");return end
+        C:StartAntiAFK()
+    end)
+    textRow(safety,"Helps prevent idle disconnects. Requires executor support; it cannot prevent server shutdowns or connection loss.")
+    local antiAFKStatus=textRow(safety,"Off")
     local sessionGroup=toolsGroup("Session","Right")
     textRow(sessionGroup,"Close the changelog, then press Play when the game menu appears.")
     toggle(sessionGroup,"AutoPlay","Auto enter game",function(value)
@@ -3146,6 +3194,8 @@ local ok, failure = xpcall(function()
         local flyJob=C.Jobs.Fly;local speedJob=C.Jobs.SpeedBoost
         mobilityStatus:SetText("Fly: "..(flyJob and flyJob.Reason or "Off").."\nSpeed: "..(speedJob and speedJob.Reason or "Off"))
         C:PollRejoin()
+        local idleJob=C.Jobs.AntiAFK
+        antiAFKStatus:SetText(idleJob and idleJob.Reason or "Off")
         local entryJob=C.Jobs.AutoPlay
         menuEntryStatus:SetText(entryJob and entryJob.Reason or "Off")
         local sessionText=C.Session.Status
